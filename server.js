@@ -103,18 +103,20 @@ client.on('disconnected', async () => {
 });
 
 // ESCUTAR MENSAGENS E GRAVAR NO HISTÓRICO
-client.on('message', async msg => {
-    if(msg.isStatus || msg.from.includes('@g.us')) return; // Ignora grupos/status
+// Usamos 'message_create' para pegar TAMBÉM as mensagens que VOCÊ envia pelo celular
+client.on('message_create', async msg => {
+    if(msg.isStatus || msg.from.includes('@g.us') || msg.to.includes('@g.us')) return; // Ignora grupos/status
 
-    const fromPhone = msg.from.replace('@c.us', '');
-    const body = msg.body;
     const isFromMe = msg.fromMe;
+    // Se for de mim, o numero do contato está em 'to', se for dele, está em 'from'
+    const contactPhone = isFromMe ? msg.to.replace('@c.us', '') : msg.from.replace('@c.us', '');
+    const body = msg.body;
 
-    console.log(`📩 Msg ${isFromMe ? 'enviada' : 'recebida'}: ${fromPhone}`);
+    console.log(`📩 Chat Update (${isFromMe ? 'Enviada' : 'Recebida'}): ${contactPhone}`);
 
     // Atualizar DB
     const contacts = getContacts();
-    const match = formatPhoneForMatch(fromPhone);
+    const match = formatPhoneForMatch(contactPhone);
     const contactIndex = contacts.findIndex(c => formatPhoneForMatch(c.phone) === match);
 
     if (contactIndex >= 0) {
@@ -122,24 +124,30 @@ client.on('message', async msg => {
         
         // Adiciona ao histórico
         if (!c.chatHistory) c.chatHistory = [];
-        c.chatHistory.push({
-            id: msg.id.id,
-            role: isFromMe ? 'agent' : 'client',
-            content: body,
-            timestamp: Date.now()
-        });
+        
+        // Evita duplicar mensagens muito recentes (ex: enviadas via API)
+        const isDuplicate = c.chatHistory.some(m => m.content === body && (Date.now() - m.timestamp) < 5000);
+        
+        if (!isDuplicate) {
+            c.chatHistory.push({
+                id: msg.id.id,
+                role: isFromMe ? 'agent' : 'client',
+                content: body,
+                timestamp: Date.now()
+            });
 
-        // Se for resposta do cliente, atualiza flags
-        if (!isFromMe) {
-            c.hasUnreadReply = true;
-            c.lastReplyContent = body;
-            c.lastReplyTimestamp = Date.now();
-            // Reseta automação se cliente respondeu
-            c.automationStage = 0; // IDLE
+            // Se for resposta do cliente, atualiza flags
+            if (!isFromMe) {
+                c.hasUnreadReply = true;
+                c.lastReplyContent = body;
+                c.lastReplyTimestamp = Date.now();
+                // Reseta automação se cliente respondeu
+                c.automationStage = 0; // IDLE
+            }
+            
+            contacts[contactIndex] = c;
+            saveContacts(contacts);
         }
-
-        contacts[contactIndex] = c;
-        saveContacts(contacts);
     }
 });
 
@@ -197,15 +205,7 @@ setInterval(async () => {
                 c.lastAutomatedMsgDate = new Date().toISOString();
                 c.automationStage = isNudge ? 2 : 1; // Avança estágio
                 
-                // Grava no histórico
-                if(!c.chatHistory) c.chatHistory = [];
-                c.chatHistory.push({
-                    id: `auto-${Date.now()}`,
-                    role: 'agent',
-                    content: text,
-                    timestamp: Date.now()
-                });
-
+                // Grava no histórico (o evento message_create vai capturar, mas garantimos aqui)
                 changed = true;
             } catch (e) {
                 console.error(`❌ Falha envio auto ${c.name}:`, e.message);
@@ -240,21 +240,6 @@ app.post('/send', async (req, res) => {
         try { const nid = await client.getNumberId(chatId); if(nid) finalId = nid._serialized; } catch(e){}
         
         await client.sendMessage(finalId, message);
-        
-        // Grava histórico manualmente (já que o evento 'message' fromMe as vezes demora)
-        const contacts = getContacts();
-        const idx = contacts.findIndex(c => formatPhoneForMatch(c.phone) === formatPhoneForMatch(phone));
-        if (idx >= 0) {
-            if(!contacts[idx].chatHistory) contacts[idx].chatHistory = [];
-            contacts[idx].chatHistory.push({
-                id: `manual-${Date.now()}`,
-                role: 'agent',
-                content: message,
-                timestamp: Date.now()
-            });
-            saveContacts(contacts);
-        }
-
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
