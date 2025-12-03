@@ -44,6 +44,7 @@ function saveSettings(settings) {
 }
 
 function formatPhoneForMatch(phone) {
+    if (!phone) return '';
     return phone.replace(/\D/g, '').slice(-8); // Compara os ultimos 8 digitos
 }
 
@@ -72,7 +73,16 @@ async function generateMessage(contact, settings, isNudge) {
 
     // 2. Fallback Templates
     if (isNudge) return `Oi ${contact.name}, tudo bem? Sou eu, ${agentName}. Chegou a ver minha mensagem anterior?`;
-    return `Olá ${contact.name}, aqui é ${agentName} da ${agencyName}. Tudo bem? Passando para saber se continua na busca pelo seu imóvel ou se podemos retomar a pesquisa com novas opções.`;
+    
+    switch (contact.type) {
+        case 'Proprietário':
+            return `Olá ${contact.name}, aqui é ${agentName} da ${agencyName}. Como estão as coisas? Gostaria de saber se o imóvel ainda está disponível para venda ou se houve alguma mudança. Abraço!`;
+        case 'Construtor':
+            return `Olá ${contact.name}, aqui é ${agentName} da ${agencyName}. Tudo bem? Estou atualizando nossa carteira de áreas e lembrei de você. Ainda está buscando novos terrenos na região?`;
+        case 'Cliente/Comprador':
+        default:
+            return `Olá ${contact.name}, aqui é ${agentName} da ${agencyName}. Tudo bem? Passando para saber se continua na busca pelo seu imóvel ou se podemos retomar a pesquisa com novas opções.`;
+    }
 }
 
 // --- WHATSAPP SETUP ---
@@ -103,12 +113,10 @@ client.on('disconnected', async () => {
 });
 
 // ESCUTAR MENSAGENS E GRAVAR NO HISTÓRICO
-// Usamos 'message_create' para pegar TAMBÉM as mensagens que VOCÊ envia pelo celular
 client.on('message_create', async msg => {
     if(msg.isStatus || msg.from.includes('@g.us') || msg.to.includes('@g.us')) return; // Ignora grupos/status
 
     const isFromMe = msg.fromMe;
-    // Se for de mim, o numero do contato está em 'to', se for dele, está em 'from'
     const contactPhone = isFromMe ? msg.to.replace('@c.us', '') : msg.from.replace('@c.us', '');
     const body = msg.body;
 
@@ -122,10 +130,9 @@ client.on('message_create', async msg => {
     if (contactIndex >= 0) {
         const c = contacts[contactIndex];
         
-        // Adiciona ao histórico
         if (!c.chatHistory) c.chatHistory = [];
         
-        // Evita duplicar mensagens muito recentes (ex: enviadas via API)
+        // Evita duplicar mensagens muito recentes
         const isDuplicate = c.chatHistory.some(m => m.content === body && (Date.now() - m.timestamp) < 5000);
         
         if (!isDuplicate) {
@@ -136,13 +143,12 @@ client.on('message_create', async msg => {
                 timestamp: Date.now()
             });
 
-            // Se for resposta do cliente, atualiza flags
+            // Se for resposta do cliente
             if (!isFromMe) {
                 c.hasUnreadReply = true;
                 c.lastReplyContent = body;
                 c.lastReplyTimestamp = Date.now();
-                // Reseta automação se cliente respondeu
-                c.automationStage = 0; // IDLE
+                c.automationStage = 0; // Reseta automação
             }
             
             contacts[contactIndex] = c;
@@ -155,7 +161,7 @@ client.on('message_create', async msg => {
 setInterval(async () => {
     if (!isReady) return;
     const settings = getSettings();
-    if (!settings.serverAutomationEnabled) return; // Só roda se usuário ativou
+    if (!settings.serverAutomationEnabled) return;
 
     console.log("⚙️ Rodando ciclo de automação...");
     const contacts = getContacts();
@@ -165,19 +171,16 @@ setInterval(async () => {
     for (let i = 0; i < contacts.length; i++) {
         const c = contacts[i];
         
-        // Pula se: automação desligada no contato, tem resposta pendente ou já finalizou ciclo
         if (c.autoPilotEnabled === false || c.hasUnreadReply || c.automationStage === 3) continue;
 
         let shouldSend = false;
         let isNudge = false;
         
-        // Regra 1: Follow-up Inicial (IDLE)
         if (c.automationStage === 0) {
             const lastDate = new Date(c.lastContactDate).getTime();
             const daysSince = (now - lastDate) / (1000 * 60 * 60 * 24);
             if (daysSince >= c.followUpFrequencyDays) shouldSend = true;
         }
-        // Regra 2: Cobrança (WAITING_1 -> 24h depois)
         else if (c.automationStage === 1) {
             const lastAuto = new Date(c.lastAutomatedMsgDate).getTime();
             const hoursSince = (now - lastAuto) / (1000 * 60 * 60);
@@ -188,10 +191,8 @@ setInterval(async () => {
             console.log(`🤖 Enviando auto para ${c.name}...`);
             const text = await generateMessage(c, settings, isNudge);
             
-            // Enviar via WhatsApp
             const chatId = `${c.phone.replace(/\D/g,'')}@c.us`;
             try {
-                // Valida número
                 let finalId = chatId;
                 try {
                     const nid = await client.getNumberId(chatId);
@@ -200,12 +201,9 @@ setInterval(async () => {
 
                 await client.sendMessage(finalId, text);
 
-                // Atualizar Contato
                 c.lastContactDate = new Date().toISOString();
                 c.lastAutomatedMsgDate = new Date().toISOString();
-                c.automationStage = isNudge ? 2 : 1; // Avança estágio
-                
-                // Grava no histórico (o evento message_create vai capturar, mas garantimos aqui)
+                c.automationStage = isNudge ? 2 : 1;
                 changed = true;
             } catch (e) {
                 console.error(`❌ Falha envio auto ${c.name}:`, e.message);
@@ -217,15 +215,11 @@ setInterval(async () => {
 
 }, 60000); // Roda a cada 60 segundos
 
-
 // --- ENDPOINTS ---
-
 app.get('/status', (req, res) => res.json({ status: clientStatus, isReady }));
 app.get('/qr', (req, res) => res.json({ qrCode: qrCodeData }));
-
 app.get('/settings', (req, res) => res.json(getSettings()));
 app.post('/settings', (req, res) => { saveSettings(req.body); res.json({success: true}); });
-
 app.get('/contacts', (req, res) => res.json(getContacts()));
 app.post('/contacts', (req, res) => { if(saveContacts(req.body)) res.json({success: true}); else res.status(500).json({error: 'Save failed'}); });
 
@@ -233,12 +227,10 @@ app.post('/contacts', (req, res) => { if(saveContacts(req.body)) res.json({succe
 app.post('/send', async (req, res) => {
     if (!isReady) return res.status(503).json({ error: 'Offline' });
     const { phone, message } = req.body;
-    
     try {
         const chatId = `${phone.replace(/\D/g,'')}@c.us`;
         let finalId = chatId;
         try { const nid = await client.getNumberId(chatId); if(nid) finalId = nid._serialized; } catch(e){}
-        
         await client.sendMessage(finalId, message);
         res.json({ success: true });
     } catch (e) {
